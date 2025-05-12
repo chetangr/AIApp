@@ -1,0 +1,2592 @@
+import streamlit as st
+import pandas as pd
+import time
+import json
+import os
+import uuid
+import sys
+import traceback
+from datetime import datetime
+
+# Add project root to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Import modules
+from core.database import DatabaseConnector
+from core.orchestration_simple import SimpleOrchestrator, SystemState, AgentState, Message
+from utils import format_timestamp, time_difference, truncate_text
+from utils.llm_client import claude_client
+
+# Fallback to the local implementation if needed
+from get_project_name import get_project_name_from_requirements
+
+# Page configuration
+st.set_page_config(
+    page_title="AI Development Team",
+    page_icon="🚀",
+    layout="wide",
+)
+
+# Initialize database connection
+db_connector = DatabaseConnector()
+
+# Initialize session state
+if "project_id" not in st.session_state:
+    st.session_state.project_id = None
+    
+if "tasks" not in st.session_state:
+    st.session_state.tasks = []
+    
+if "agent_logs" not in st.session_state:
+    st.session_state.agent_logs = []
+    
+if "orchestrator" not in st.session_state:
+    st.session_state.orchestrator = SimpleOrchestrator(db_connector=db_connector)
+    
+if "requirements" not in st.session_state:
+    st.session_state.requirements = ""
+    
+if "project_outputs" not in st.session_state:
+    st.session_state.project_outputs = {}
+
+# Function to log agent activity
+def log_agent_activity(agent_type, message):
+    st.session_state.agent_logs.append({
+        "agent": agent_type,
+        "message": message,
+        "timestamp": datetime.now()
+    })
+
+# Function to store project output artifacts
+def store_output_artifact(agent_type, task_id, output_type, content):
+    # If this project doesn't have outputs initialized yet
+    if st.session_state.project_id not in st.session_state.project_outputs:
+        st.session_state.project_outputs[st.session_state.project_id] = {}
+        
+    # If this agent doesn't have outputs initialized yet
+    project_outputs = st.session_state.project_outputs[st.session_state.project_id]
+    if agent_type not in project_outputs:
+        project_outputs[agent_type] = {}
+        
+    # If this task doesn't have outputs initialized yet
+    agent_outputs = project_outputs[agent_type]
+    if task_id not in agent_outputs:
+        agent_outputs[task_id] = {}
+        
+    # Store output by type
+    task_outputs = agent_outputs[task_id]
+    task_outputs[output_type] = content
+    
+    # Also store in database for persistence
+    if st.session_state.orchestrator and st.session_state.orchestrator.db_connector:
+        agent_id = "system"  # Default
+        
+        # Try to get actual agent ID
+        agent = st.session_state.orchestrator.system_state.get_agent_by_type(agent_type)
+        if agent:
+            agent_id = agent.agent_id
+            
+        # Store in database
+        st.session_state.orchestrator.db_connector.store_agent_output(
+            task_id=task_id,
+            agent_id=agent_id,
+            output_type=output_type,
+            content=content
+        )
+    
+    # Return output ID for reference
+    return f"{agent_type}_{task_id}_{output_type}"
+
+# Function to process project requirements
+def process_requirements(requirements):
+    orchestrator = st.session_state.orchestrator
+    
+    # Create new project if needed
+    if not st.session_state.project_id:
+        with st.spinner("Creating new project..."):
+            # Try to use Claude API first, with fallback to rule-based extraction
+            if claude_client.is_available():
+                log_agent_activity("system", "Using Claude to extract project name")
+                project_name = claude_client.extract_project_name(requirements)
+            else:
+                log_agent_activity("system", "Claude API not available, using rule-based extraction")
+                project_name = get_project_name_from_requirements(requirements)
+
+            log_agent_activity("system", f"Extracted project name: {project_name}")
+
+            project_id = orchestrator.initialize_project(
+                name=project_name.replace('_', ' ').title(),  # Convert to title case for display
+                description=requirements[:200] if len(requirements) > 200 else requirements,
+                requirements=requirements
+            )
+            st.session_state.project_id = project_id
+            log_agent_activity("system", f"Created new project: {project_name}")
+
+    # Process with Project Manager
+    with st.spinner("Project Manager is analyzing requirements..."):
+        agent = orchestrator.system_state.get_agent_by_type("project_manager")
+        if agent:
+            try:
+                # Parse requirements
+                log_agent_activity("project_manager", "Parsing requirements...")
+                parsed_requirements = agent.agent_instance.parse_requirements(requirements)
+                
+                # Create task breakdown
+                log_agent_activity("project_manager", "Creating task breakdown...")
+                tasks = agent.agent_instance.create_task_breakdown(parsed_requirements)
+                
+                # Assign tasks to agents
+                log_agent_activity("project_manager", "Assigning tasks to agents...")
+                assigned_tasks = agent.agent_instance.assign_tasks_to_agents(tasks)
+                
+                # Store tasks in database and session state
+                for task in assigned_tasks:
+                    # Create task in database
+                    task_id = orchestrator.db_connector.create_task(
+                        project_id=st.session_state.project_id,
+                        title=task.get("title", "Untitled Task"),
+                        description=task.get("description", ""),
+                        assigned_agent=task.get("assigned_agent", "developer")
+                    )
+                    
+                    # Update task with ID
+                    task["id"] = task_id
+                    
+                    # Add to session state
+                    st.session_state.tasks.append(task)
+                    
+                    # Log task creation
+                    log_agent_activity("project_manager", f"Created task: {task['title']} (assigned to {task['assigned_agent']})")
+                    
+                    # Send task to assigned agent via message bus
+                    target_agent = orchestrator.system_state.get_agent_by_type(task.get("assigned_agent", "developer"))
+                    if target_agent:
+                        orchestrator.message_bus.send_message(Message(
+                            sender_id=agent.agent_id,
+                            receiver_id=target_agent.agent_id,
+                            content=task,
+                            message_type="task",
+                            task_id=task_id,
+                            project_id=st.session_state.project_id
+                        ))
+                
+                log_agent_activity("project_manager", f"Created {len(assigned_tasks)} tasks")
+                return True
+                
+            except Exception as e:
+                log_agent_activity("project_manager", f"Error: {str(e)}")
+                traceback.print_exc()
+                return False
+        else:
+            log_agent_activity("system", "Project Manager agent not found")
+            return False
+
+# Function to run a specific task
+def get_app_name_from_task(task):
+    """Extract an app name from the task description/title"""
+    if "title" in task:
+        # Clean the task title to use as app name
+        app_name = task["title"].lower()
+        # Remove any non-alphanumeric characters except spaces
+        import re
+        app_name = re.sub(r'[^\w\s]', '', app_name)
+        # Replace spaces with underscores
+        app_name = app_name.replace(' ', '_')
+        return app_name
+    return "app"  # Default fallback
+
+def get_project_type(task):
+    """Determine what type of project to create based on task details"""
+    title = task.get("title", "").lower()
+    description = task.get("description", "").lower()
+    content = title + " " + description
+
+    project_type = "generic"
+
+    # Check for mobile apps
+    if "android" in content or "mobile" in content:
+        if "flutter" in content:
+            project_type = "flutter"
+        elif "react native" in content:
+            project_type = "react_native"
+        elif "android" in content:
+            project_type = "android"
+        elif "ios" in content or "iphone" in content or "apple" in content:
+            project_type = "ios"
+        else:
+            project_type = "flutter"  # Default to Flutter for mobile
+
+    # Check for web apps
+    elif "web" in content:
+        if "react" in content:
+            project_type = "react"
+        elif "angular" in content:
+            project_type = "angular"
+        elif "vue" in content:
+            project_type = "vue"
+        else:
+            project_type = "react"  # Default to React for web
+
+    # Check for backend/server
+    elif "api" in content or "server" in content or "backend" in content:
+        if "python" in content or "django" in content or "flask" in content:
+            project_type = "python_backend"
+        elif "node" in content or "express" in content:
+            project_type = "node_backend"
+        else:
+            project_type = "python_backend"  # Default to Python for backend
+
+    return project_type
+
+def create_flutter_app(task, app_name, project_dir):
+    """Create a complete Flutter app based on the task"""
+    log_agent_activity("developer", f"Creating Flutter app: {app_name}")
+
+    # Create the directories
+    os.makedirs(os.path.join(project_dir, "lib"), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, "assets"), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, "test"), exist_ok=True)
+
+    # Create pubspec.yaml
+    pubspec_content = f"""name: {app_name}
+description: {task.get("description", "A new Flutter application")}
+version: 1.0.0+1
+
+environment:
+  sdk: ">=2.16.0 <3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.2
+  provider: ^6.0.0
+  http: ^0.13.4
+  shared_preferences: ^2.0.15
+  sqflite: ^2.0.2
+  path: ^1.8.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^1.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+"""
+    with open(os.path.join(project_dir, "pubspec.yaml"), "w") as f:
+        f.write(pubspec_content)
+
+    # Create main.dart
+    main_content = """import 'package:flutter/material.dart';
+import 'screens/home_screen.dart';
+import 'screens/add_entry_screen.dart';
+import 'screens/view_entry_screen.dart';
+
+void main() {
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Pet Diary',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        visualDensity: VisualDensity.adaptivePlatformDensity,
+      ),
+      initialRoute: '/',
+      routes: {
+        '/': (context) => HomeScreen(),
+        '/add_entry': (context) => AddEntryScreen(),
+        '/view_entry': (context) => ViewEntryScreen(),
+      },
+    );
+  }
+}
+"""
+    os.makedirs(os.path.join(project_dir, "lib"), exist_ok=True)
+    with open(os.path.join(project_dir, "lib", "main.dart"), "w") as f:
+        f.write(main_content)
+
+    # Create screens directory and home_screen.dart
+    os.makedirs(os.path.join(project_dir, "lib", "screens"), exist_ok=True)
+    home_screen_content = """import 'package:flutter/material.dart';
+import '../models/diary_entry.dart';
+import '../services/database_helper.dart';
+
+class HomeScreen extends StatefulWidget {
+  @override
+  _HomeScreenState createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+  List<DiaryEntry> _entries = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadEntries();
+  }
+
+  Future<void> _loadEntries() async {
+    final entries = await _dbHelper.getEntries();
+    setState(() {
+      _entries = entries;
+      _isLoading = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Pet Diary'),
+      ),
+      body: _isLoading
+          ? Center(child: CircularProgressIndicator())
+          : _entries.isEmpty
+              ? Center(child: Text('No entries yet. Add your first one!'))
+              : ListView.builder(
+                  itemCount: _entries.length,
+                  itemBuilder: (context, index) {
+                    final entry = _entries[index];
+                    return Card(
+                      margin: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                      child: ListTile(
+                        title: Text(entry.title),
+                        subtitle: Text(entry.date),
+                        trailing: Icon(Icons.arrow_forward_ios),
+                        onTap: () {
+                          Navigator.pushNamed(
+                            context,
+                            '/view_entry',
+                            arguments: entry,
+                          ).then((_) => _loadEntries());
+                        },
+                      ),
+                    );
+                  },
+                ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          Navigator.pushNamed(context, '/add_entry')
+              .then((_) => _loadEntries());
+        },
+        child: Icon(Icons.add),
+      ),
+    );
+  }
+}
+"""
+    with open(os.path.join(project_dir, "lib", "screens", "home_screen.dart"), "w") as f:
+        f.write(home_screen_content)
+
+    # Create add_entry_screen.dart
+    add_entry_content = """import 'package:flutter/material.dart';
+import '../models/diary_entry.dart';
+import '../services/database_helper.dart';
+
+class AddEntryScreen extends StatefulWidget {
+  @override
+  _AddEntryScreenState createState() => _AddEntryScreenState();
+}
+
+class _AddEntryScreenState extends State<AddEntryScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _titleController = TextEditingController();
+  final _descriptionController = TextEditingController();
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+  String _selectedActivity = 'Feeding';
+  DateTime _selectedDate = DateTime.now();
+
+  final List<String> _activities = [
+    'Feeding',
+    'Walking',
+    'Grooming',
+    'Vet Visit',
+    'Play Time',
+    'Training',
+    'Medication',
+    'Other'
+  ];
+
+  Future<void> _selectDate(BuildContext context) async {
+    final DateTime? picked = await showDatePicker(
+      context: context,
+      initialDate: _selectedDate,
+      firstDate: DateTime(2000),
+      lastDate: DateTime(2101),
+    );
+    if (picked != null && picked != _selectedDate) {
+      setState(() {
+        _selectedDate = picked;
+      });
+    }
+  }
+
+  Future<void> _saveEntry() async {
+    if (_formKey.currentState!.validate()) {
+      final entry = DiaryEntry(
+        id: 0, // Will be set by database
+        title: _titleController.text,
+        description: _descriptionController.text,
+        activity: _selectedActivity,
+        date: r'${_selectedDate.year}-${_selectedDate.month}-${_selectedDate.day}',
+      );
+
+      await _dbHelper.insertEntry(entry);
+      Navigator.pop(context);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Add New Entry'),
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Form(
+          key: _formKey,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextFormField(
+                controller: _titleController,
+                decoration: InputDecoration(
+                  labelText: 'Title',
+                  border: OutlineInputBorder(),
+                ),
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Please enter a title';
+                  }
+                  return null;
+                },
+              ),
+              SizedBox(height: 16),
+              DropdownButtonFormField<String>(
+                value: _selectedActivity,
+                decoration: InputDecoration(
+                  labelText: 'Activity',
+                  border: OutlineInputBorder(),
+                ),
+                items: _activities.map((String activity) {
+                  return DropdownMenuItem<String>(
+                    value: activity,
+                    child: Text(activity),
+                  );
+                }).toList(),
+                onChanged: (String? newValue) {
+                  setState(() {
+                    _selectedActivity = newValue!;
+                  });
+                },
+              ),
+              SizedBox(height: 16),
+              Row(
+                children: [
+                  Text(
+                    r'Date: ${_selectedDate.year}-${_selectedDate.month}-${_selectedDate.day}',
+                    style: TextStyle(fontSize: 16),
+                  ),
+                  SizedBox(width: 16),
+                  ElevatedButton(
+                    onPressed: () => _selectDate(context),
+                    child: Text('Select Date'),
+                  ),
+                ],
+              ),
+              SizedBox(height: 16),
+              TextFormField(
+                controller: _descriptionController,
+                decoration: InputDecoration(
+                  labelText: 'Description',
+                  border: OutlineInputBorder(),
+                ),
+                maxLines: 5,
+                validator: (value) {
+                  if (value == null || value.isEmpty) {
+                    return 'Please enter a description';
+                  }
+                  return null;
+                },
+              ),
+              SizedBox(height: 24),
+              Center(
+                child: ElevatedButton(
+                  onPressed: _saveEntry,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 32.0,
+                      vertical: 12.0,
+                    ),
+                    child: Text(
+                      'Save Entry',
+                      style: TextStyle(fontSize: 16),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _descriptionController.dispose();
+    super.dispose();
+  }
+}
+"""
+    with open(os.path.join(project_dir, "lib", "screens", "add_entry_screen.dart"), "w") as f:
+        f.write(add_entry_content)
+
+    # Create view_entry_screen.dart
+    view_entry_content = """import 'package:flutter/material.dart';
+import '../models/diary_entry.dart';
+import '../services/database_helper.dart';
+
+class ViewEntryScreen extends StatelessWidget {
+  final DatabaseHelper _dbHelper = DatabaseHelper();
+
+  @override
+  Widget build(BuildContext context) {
+    final DiaryEntry entry = ModalRoute.of(context)!.settings.arguments as DiaryEntry;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Entry Details'),
+        actions: [
+          IconButton(
+            icon: Icon(Icons.edit),
+            onPressed: () {
+              // TODO: Implement edit functionality
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(content: Text('Edit functionality coming soon!')),
+              );
+            },
+          ),
+          IconButton(
+            icon: Icon(Icons.delete),
+            onPressed: () {
+              _showDeleteConfirmation(context, entry);
+            },
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              entry.title,
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            SizedBox(height: 8),
+            Row(
+              children: [
+                Chip(
+                  label: Text(entry.activity),
+                  backgroundColor: Colors.blue.shade100,
+                ),
+                SizedBox(width: 8),
+                Text(
+                  r'Date: ${entry.date}',
+                  style: TextStyle(
+                    fontSize: 16,
+                    color: Colors.grey.shade700,
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: 16),
+            Container(
+              padding: EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade100,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                entry.description,
+                style: TextStyle(fontSize: 16),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showDeleteConfirmation(BuildContext context, DiaryEntry entry) async {
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text('Confirm Delete'),
+          content: SingleChildScrollView(
+            child: ListBody(
+              children: <Widget>[
+                Text('Are you sure you want to delete this entry?'),
+                Text('This action cannot be undone.'),
+              ],
+            ),
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: Text('Cancel'),
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+            ),
+            TextButton(
+              child: Text(
+                'Delete',
+                style: TextStyle(color: Colors.red),
+              ),
+              onPressed: () async {
+                await _dbHelper.deleteEntry(entry.id);
+                Navigator.of(context).pop();
+                Navigator.of(context).pop();
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+"""
+    with open(os.path.join(project_dir, "lib", "screens", "view_entry_screen.dart"), "w") as f:
+        f.write(view_entry_content)
+
+    # Create models directory and diary_entry.dart
+    os.makedirs(os.path.join(project_dir, "lib", "models"), exist_ok=True)
+    diary_entry_content = """class DiaryEntry {
+  final int id;
+  final String title;
+  final String description;
+  final String activity;
+  final String date;
+
+  DiaryEntry({
+    required this.id,
+    required this.title,
+    required this.description,
+    required this.activity,
+    required this.date,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'title': title,
+      'description': description,
+      'activity': activity,
+      'date': date,
+    };
+  }
+
+  factory DiaryEntry.fromMap(Map<String, dynamic> map) {
+    return DiaryEntry(
+      id: map['id'],
+      title: map['title'],
+      description: map['description'],
+      activity: map['activity'],
+      date: map['date'],
+    );
+  }
+}
+"""
+    with open(os.path.join(project_dir, "lib", "models", "diary_entry.dart"), "w") as f:
+        f.write(diary_entry_content)
+
+    # Create services directory and database_helper.dart
+    os.makedirs(os.path.join(project_dir, "lib", "services"), exist_ok=True)
+    database_helper_content = """import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import '../models/diary_entry.dart';
+
+class DatabaseHelper {
+  static final DatabaseHelper _instance = DatabaseHelper._internal();
+  static Database? _database;
+
+  factory DatabaseHelper() => _instance;
+
+  DatabaseHelper._internal();
+
+  Future<Database> get database async {
+    if (_database != null) return _database!;
+    _database = await _initDatabase();
+    return _database!;
+  }
+
+  Future<Database> _initDatabase() async {
+    final databasesPath = await getDatabasesPath();
+    final path = join(databasesPath, 'pet_diary.db');
+
+    return await openDatabase(
+      path,
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE diary_entries(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            description TEXT,
+            activity TEXT,
+            date TEXT
+          )
+        ''');
+      },
+    );
+  }
+
+  Future<int> insertEntry(DiaryEntry entry) async {
+    final db = await database;
+    return await db.insert('diary_entries', entry.toMap());
+  }
+
+  Future<List<DiaryEntry>> getEntries() async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      'diary_entries',
+      orderBy: 'date DESC',
+    );
+
+    return List.generate(maps.length, (i) {
+      return DiaryEntry.fromMap(maps[i]);
+    });
+  }
+
+  Future<DiaryEntry?> getEntry(int id) async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      'diary_entries',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+
+    if (maps.isNotEmpty) {
+      return DiaryEntry.fromMap(maps.first);
+    }
+    return null;
+  }
+
+  Future<int> updateEntry(DiaryEntry entry) async {
+    final db = await database;
+    return await db.update(
+      'diary_entries',
+      entry.toMap(),
+      where: 'id = ?',
+      whereArgs: [entry.id],
+    );
+  }
+
+  Future<int> deleteEntry(int id) async {
+    final db = await database;
+    return await db.delete(
+      'diary_entries',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+}
+"""
+    with open(os.path.join(project_dir, "lib", "services", "database_helper.dart"), "w") as f:
+        f.write(database_helper_content)
+
+    # Create test directory and widget_test.dart
+    os.makedirs(os.path.join(project_dir, "test"), exist_ok=True)
+    test_content = """import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:pet_diary/main.dart';
+
+void main() {
+  testWidgets('App should launch and show title', (WidgetTester tester) async {
+    await tester.pumpWidget(MyApp());
+    expect(find.text('Pet Diary'), findsOneWidget);
+  });
+}
+"""
+    with open(os.path.join(project_dir, "test", "widget_test.dart"), "w") as f:
+        f.write(test_content)
+
+    # Create README.md
+    readme_content = f"""# {app_name.replace('_', ' ').title()}
+
+A Flutter application for tracking your pet's daily activities.
+
+## Features
+
+- Track feeding, walking, grooming, vet visits and more
+- Log date and details for each activity
+- View history of all pet care activities
+- Edit or delete entries
+
+## Getting Started
+
+### Prerequisites
+
+- Flutter SDK
+- Android Studio / Xcode (for deployment)
+
+### Installation
+
+1. Clone this repository
+2. Navigate to the project directory
+3. Run `flutter pub get` to install dependencies
+4. Run `flutter run` to start the app
+
+## Screenshots
+
+(Screenshots will be added once the app is fully developed)
+
+## Testing
+
+Run `flutter test` to execute the test suite.
+"""
+    with open(os.path.join(project_dir, "README.md"), "w") as f:
+        f.write(readme_content)
+
+    log_agent_activity("developer", f"Flutter app '{app_name}' created successfully at {project_dir}")
+    return True
+
+def create_android_app(task, app_name, project_dir):
+    """Create a complete Android app based on the task"""
+    log_agent_activity("developer", f"Creating Android app: {app_name}")
+
+    # Create directory structure
+    os.makedirs(os.path.join(project_dir, "app", "src", "main", "java", "com", "example", app_name), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, "app", "src", "main", "res", "layout"), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, "app", "src", "main", "res", "values"), exist_ok=True)
+
+    # Create build.gradle (project level)
+    build_gradle_project = """// Top-level build file
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.0.4'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.6.10'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}
+"""
+    with open(os.path.join(project_dir, "build.gradle"), "w") as f:
+        f.write(build_gradle_project)
+
+    # Create build.gradle (app level)
+    build_gradle_app = """plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+    id 'kotlin-kapt'
+}
+
+android {
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.example.petdiary"
+        minSdk 21
+        targetSdk 33
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+    buildFeatures {
+        viewBinding true
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.7.0'
+    implementation 'androidx.appcompat:appcompat:1.4.1'
+    implementation 'com.google.android.material:material:1.5.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.3'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.4.1'
+    implementation 'androidx.lifecycle:lifecycle-livedata-ktx:2.4.1'
+    implementation 'androidx.navigation:navigation-fragment-ktx:2.4.1'
+    implementation 'androidx.navigation:navigation-ui-ktx:2.4.1'
+    implementation 'androidx.room:room-runtime:2.4.2'
+    implementation 'androidx.room:room-ktx:2.4.2'
+    kapt 'androidx.room:room-compiler:2.4.2'
+
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.3'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.4.0'
+}
+"""
+    os.makedirs(os.path.join(project_dir, "app"), exist_ok=True)
+    with open(os.path.join(project_dir, "app", "build.gradle"), "w") as f:
+        f.write(build_gradle_app)
+
+    # Create AndroidManifest.xml
+    manifest_content = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.petdiary">
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.PetDiary">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".AddEntryActivity" />
+        <activity android:name=".ViewEntryActivity" />
+    </application>
+
+</manifest>
+"""
+    os.makedirs(os.path.join(project_dir, "app", "src", "main"), exist_ok=True)
+    with open(os.path.join(project_dir, "app", "src", "main", "AndroidManifest.xml"), "w") as f:
+        f.write(manifest_content)
+
+    # Create MainActivity.kt
+    main_activity_content = """package com.example.petdiary
+
+import android.content.Intent
+import android.os.Bundle
+import android.view.View
+import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.ViewModelProvider
+import androidx.recyclerview.widget.LinearLayoutManager
+import com.example.petdiary.databinding.ActivityMainBinding
+import com.example.petdiary.db.DiaryEntry
+
+class MainActivity : AppCompatActivity(), DiaryEntryAdapter.OnItemClickListener {
+
+    private lateinit var binding: ActivityMainBinding
+    private lateinit var viewModel: MainViewModel
+    private lateinit var adapter: DiaryEntryAdapter
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        // Setup ViewModel
+        viewModel = ViewModelProvider(this).get(MainViewModel::class.java)
+
+        // Setup RecyclerView
+        adapter = DiaryEntryAdapter(this)
+        binding.recyclerView.adapter = adapter
+        binding.recyclerView.layoutManager = LinearLayoutManager(this)
+
+        // Observe diary entries
+        viewModel.allEntries.observe(this, { entries ->
+            entries?.let {
+                adapter.setEntries(it)
+                updateEmptyView(it)
+            }
+        })
+
+        // Setup FAB
+        binding.fab.setOnClickListener {
+            val intent = Intent(this, AddEntryActivity::class.java)
+            startActivity(intent)
+        }
+    }
+
+    private fun updateEmptyView(entries: List<DiaryEntry>) {
+        if (entries.isEmpty()) {
+            binding.emptyView.visibility = View.VISIBLE
+            binding.recyclerView.visibility = View.GONE
+        } else {
+            binding.emptyView.visibility = View.GONE
+            binding.recyclerView.visibility = View.VISIBLE
+        }
+    }
+
+    override fun onItemClick(entry: DiaryEntry) {
+        val intent = Intent(this, ViewEntryActivity::class.java)
+        intent.putExtra(ViewEntryActivity.EXTRA_ENTRY_ID, entry.id)
+        startActivity(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshEntries()
+    }
+}
+"""
+    java_dir = os.path.join(project_dir, "app", "src", "main", "java", "com", "example", app_name)
+    os.makedirs(java_dir, exist_ok=True)
+    with open(os.path.join(java_dir, "MainActivity.kt"), "w") as f:
+        f.write(main_activity_content)
+
+    # Create activity_main.xml
+    main_layout_content = """<?xml version="1.0" encoding="utf-8"?>
+<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".MainActivity">
+
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent"
+            tools:listitem="@layout/item_diary_entry" />
+
+        <LinearLayout
+            android:id="@+id/emptyView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="vertical"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent">
+
+            <ImageView
+                android:layout_width="100dp"
+                android:layout_height="100dp"
+                android:src="@android:drawable/ic_menu_edit"
+                android:tint="@android:color/darker_gray" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="No entries yet. Add your first one!"
+                android:textSize="16sp" />
+
+        </LinearLayout>
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/fab"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp"
+        android:contentDescription="Add new entry"
+        app:srcCompat="@android:drawable/ic_input_add" />
+
+</androidx.coordinatorlayout.widget.CoordinatorLayout>
+"""
+    layout_dir = os.path.join(project_dir, "app", "src", "main", "res", "layout")
+    os.makedirs(layout_dir, exist_ok=True)
+    with open(os.path.join(layout_dir, "activity_main.xml"), "w") as f:
+        f.write(main_layout_content)
+
+    # Create strings.xml
+    strings_content = """<resources>
+    <string name="app_name">Pet Diary</string>
+    <string name="add_entry">Add Entry</string>
+    <string name="view_entry">View Entry</string>
+    <string name="title">Title</string>
+    <string name="date">Date</string>
+    <string name="description">Description</string>
+    <string name="activity">Activity</string>
+    <string name="save">Save</string>
+    <string name="delete">Delete</string>
+    <string name="cancel">Cancel</string>
+    <string-array name="activity_types">
+        <item>Feeding</item>
+        <item>Walking</item>
+        <item>Grooming</item>
+        <item>Vet Visit</item>
+        <item>Play Time</item>
+        <item>Training</item>
+        <item>Medication</item>
+        <item>Other</item>
+    </string-array>
+</resources>
+"""
+    values_dir = os.path.join(project_dir, "app", "src", "main", "res", "values")
+    os.makedirs(values_dir, exist_ok=True)
+    with open(os.path.join(values_dir, "strings.xml"), "w") as f:
+        f.write(strings_content)
+
+    # Create database-related files
+    os.makedirs(os.path.join(java_dir, "db"), exist_ok=True)
+
+    # Create DiaryEntry.kt
+    diary_entry_content = """package com.example.petdiary.db
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "diary_entries")
+data class DiaryEntry(
+    @PrimaryKey(autoGenerate = true) val id: Int = 0,
+    val title: String,
+    val description: String,
+    val activity: String,
+    val date: String
+)
+"""
+    with open(os.path.join(java_dir, "db", "DiaryEntry.kt"), "w") as f:
+        f.write(diary_entry_content)
+
+    # Create DiaryDao.kt
+    dao_content = """package com.example.petdiary.db
+
+import androidx.lifecycle.LiveData
+import androidx.room.*
+
+@Dao
+interface DiaryDao {
+    @Query("SELECT * FROM diary_entries ORDER BY date DESC")
+    fun getAllEntries(): LiveData<List<DiaryEntry>>
+
+    @Query("SELECT * FROM diary_entries WHERE id = :id")
+    fun getEntryById(id: Int): LiveData<DiaryEntry>
+
+    @Insert
+    suspend fun insert(entry: DiaryEntry): Long
+
+    @Update
+    suspend fun update(entry: DiaryEntry)
+
+    @Delete
+    suspend fun delete(entry: DiaryEntry)
+}
+"""
+    with open(os.path.join(java_dir, "db", "DiaryDao.kt"), "w") as f:
+        f.write(dao_content)
+
+    # Create DiaryDatabase.kt
+    database_content = """package com.example.petdiary.db
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+
+@Database(entities = [DiaryEntry::class], version = 1, exportSchema = false)
+abstract class DiaryDatabase : RoomDatabase() {
+
+    abstract fun diaryDao(): DiaryDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: DiaryDatabase? = null
+
+        fun getDatabase(context: Context): DiaryDatabase {
+            return INSTANCE ?: synchronized(this) {
+                val instance = Room.databaseBuilder(
+                    context.applicationContext,
+                    DiaryDatabase::class.java,
+                    "pet_diary_database"
+                ).build()
+                INSTANCE = instance
+                instance
+            }
+        }
+    }
+}
+"""
+    with open(os.path.join(java_dir, "db", "DiaryDatabase.kt"), "w") as f:
+        f.write(database_content)
+
+    # Create DiaryRepository.kt
+    repository_content = """package com.example.petdiary.db
+
+import androidx.lifecycle.LiveData
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+class DiaryRepository(private val diaryDao: DiaryDao) {
+
+    val allEntries: LiveData<List<DiaryEntry>> = diaryDao.getAllEntries()
+
+    fun getEntryById(id: Int): LiveData<DiaryEntry> {
+        return diaryDao.getEntryById(id)
+    }
+
+    suspend fun insert(entry: DiaryEntry): Long {
+        return withContext(Dispatchers.IO) {
+            diaryDao.insert(entry)
+        }
+    }
+
+    suspend fun update(entry: DiaryEntry) {
+        withContext(Dispatchers.IO) {
+            diaryDao.update(entry)
+        }
+    }
+
+    suspend fun delete(entry: DiaryEntry) {
+        withContext(Dispatchers.IO) {
+            diaryDao.delete(entry)
+        }
+    }
+}
+"""
+    with open(os.path.join(java_dir, "db", "DiaryRepository.kt"), "w") as f:
+        f.write(repository_content)
+
+    # Create README.md
+    readme_content = f"""# {app_name.replace('_', ' ').title()}
+
+An Android application for tracking your pet's daily activities.
+
+## Features
+
+- Track feeding, walking, grooming, vet visits and more
+- Log date and details for each activity
+- View history of all pet care activities
+- Edit or delete entries
+
+## Getting Started
+
+### Prerequisites
+
+- Android Studio
+- Android SDK
+
+### Installation
+
+1. Clone this repository
+2. Open the project in Android Studio
+3. Sync with Gradle files
+4. Run the app on an emulator or physical device
+
+## Architecture
+
+This app follows the MVVM (Model-View-ViewModel) architecture pattern and uses:
+
+- Room for local database storage
+- LiveData for observable data
+- ViewModel for UI-related data management
+- Kotlin Coroutines for asynchronous operations
+
+## Screenshots
+
+(Screenshots will be added once the app is fully developed)
+
+## Testing
+
+The app includes both unit tests and instrumentation tests.
+"""
+    with open(os.path.join(project_dir, "README.md"), "w") as f:
+        f.write(readme_content)
+
+    log_agent_activity("developer", f"Android app '{app_name}' created successfully at {project_dir}")
+    return True
+
+def get_project_name_from_requirements(requirements):
+    """Extract a project name from the requirements"""
+    import re
+    # Try to get a meaningful name from the requirements
+    words = requirements.lower().split()
+    project_words = []
+
+    # First, look for direct mentions of project name
+    direct_patterns = [
+        r'create (?:an?|the) ([\w\s]+?) (?:app|application|system|platform)',
+        r'develop (?:an?|the) ([\w\s]+?) (?:app|application|system|platform)',
+        r'build (?:an?|the) ([\w\s]+?) (?:app|application|system|platform)',
+        r'design (?:an?|the) ([\w\s]+?) (?:for|that|which|to)',
+        r'implement (?:an?|the) ([\w\s]+?) (?:for|that|which|to)',
+        r'app called ([\w\s]+?)[.,]',
+        r'application called ([\w\s]+?)[.,]',
+        r'system called ([\w\s]+?)[.,]',
+        r'platform called ([\w\s]+?)[.,]'
+    ]
+
+    for pattern in direct_patterns:
+        matches = re.search(pattern, requirements.lower())
+        if matches and matches.group(1):
+            candidate = matches.group(1).strip()
+            if len(candidate.split()) <= 4 and len(candidate) > 3:
+                project_words = candidate.split()
+                break
+
+    # Look for key phrases like "app for", "application for", "app to" if no direct name found
+    phrases = ["app for", "application for", "app to", "system for", "platform for"]
+    if not project_words:
+        for phrase in phrases:
+            if phrase in requirements.lower():
+                # Extract what comes after the phrase, up to the next period or comma
+                index = requirements.lower().find(phrase) + len(phrase)
+                end_index = min(
+                    [requirements.find(c, index) for c in ['.', ',', '\n'] if requirements.find(c, index) > 0] or [len(requirements)]
+                )
+                extracted = requirements[index:end_index].strip()
+
+                # Use the first few words (3-4) after the phrase
+                project_words = extracted.split()[:3]
+                break
+
+    # If no phrase was found, try to use key nouns
+    if not project_words:
+        nouns = ["diary", "tracker", "manager", "journal", "planner", "organizer", "app", "application",
+                "system", "calculator", "game", "messenger", "editor", "viewer", "browser", "platform", "dashboard"]
+        for word in words:
+            if word in nouns and len(project_words) < 3:
+                project_words.append(word)
+
+    # If we found some words, create a name
+    if project_words:
+        # Add subject if we can find it
+        subjects = ["pet", "health", "fitness", "finance", "food", "recipe", "movie", "book", "task",
+                   "project", "weather", "music", "photo", "video", "chat", "social", "shopping", "travel",
+                   "note", "budget", "productivity", "education", "medical", "inventory", "employee"]
+        for subject in subjects:
+            if subject in words and subject not in project_words:
+                project_words.insert(0, subject)
+                break
+
+        # Join words and clean up
+        project_name = "_".join(project_words)
+        project_name = re.sub(r'[^\w\s]', '', project_name)
+        project_name = re.sub(r'_+', '_', project_name)  # Remove duplicate underscores
+        return project_name
+
+    # Extract first meaningful sentence if all else fails
+    if len(requirements) > 10:
+        first_sentence = requirements.split('.')[0].strip()
+        words = first_sentence.split()
+        if len(words) > 3:
+            meaningful_words = [w for w in words[:4] if len(w) > 3 and w.lower() not in ['create', 'build', 'develop', 'design', 'implement', 'the', 'and', 'for']]
+            if meaningful_words:
+                return "_".join(meaningful_words).lower()
+
+    # Default fallback
+    return "my_project"
+
+def run_task(task_id):
+    orchestrator = st.session_state.orchestrator
+
+    # Get task from database
+    task = orchestrator.db_connector.get_task(task_id)
+    if not task:
+        log_agent_activity("system", f"Task with ID {task_id} not found")
+        return False
+
+    # Get agent assigned to task
+    agent_type = task.get("assigned_agent")
+    if not agent_type:
+        log_agent_activity("system", f"No agent assigned to task {task_id}")
+        return False
+
+    agent = orchestrator.system_state.get_agent_by_type(agent_type)
+    if not agent:
+        log_agent_activity("system", f"Agent {agent_type} not found")
+        return False
+
+    # Update task status to in_progress
+    orchestrator.db_connector.update_task(task_id, {"status": "in_progress"})
+
+    # Update in session state
+    for i, t in enumerate(st.session_state.tasks):
+        if t.get("id") == task_id:
+            st.session_state.tasks[i]["status"] = "in_progress"
+
+    log_agent_activity(agent_type, f"Starting work on task: {task['title']}")
+
+    # Execute task based on agent type
+    try:
+        # Get project details from the session state
+        project_id = st.session_state.project_id
+        project = orchestrator.db_connector.get_project(project_id)
+        project_requirements = project.get("description", "")
+
+        # Determine project name based on project requirements
+        project_name = get_project_name_from_requirements(project_requirements)
+
+        # Determine what type of project to create
+        project_type = get_project_type({"title": project_name, "description": project_requirements})
+
+        # Force to Flutter for any mobile app request by default (since it's cross-platform)
+        if "mobile" in project_requirements.lower() or "app" in project_requirements.lower():
+            project_type = "flutter"
+
+        # Create main project directory
+        project_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", project_name)
+
+        # Create task-specific directory within the project
+        task_name = task.get("title", "").lower().replace(" ", "_")
+        task_dir = os.path.join(project_dir, task_name)
+
+        # First task should create the main project structure
+        if not os.path.exists(project_dir):
+            log_agent_activity(agent_type, f"Creating new {project_type} project: {project_name}")
+            os.makedirs(project_dir, exist_ok=True)
+
+            # Create main structure based on project type
+            if project_type == "flutter":
+                success = create_flutter_app({"title": project_name, "description": project_requirements},
+                                            project_name, project_dir)
+                if success:
+                    log_agent_activity(agent_type, f"Created Flutter app at {project_dir}")
+            elif project_type == "android":
+                success = create_android_app({"title": project_name, "description": project_requirements},
+                                           project_name, project_dir)
+                if success:
+                    log_agent_activity(agent_type, f"Created Android app at {project_dir}")
+            else:
+                # Default to Flutter
+                success = create_flutter_app({"title": project_name, "description": project_requirements},
+                                            project_name, project_dir)
+                if success:
+                    log_agent_activity(agent_type, f"Created Flutter app at {project_dir}")
+
+        # Now implement the specific task in the existing project structure
+        log_agent_activity(agent_type, f"Implementing task '{task['title']}' in project '{project_name}'")
+
+        # Determine appropriate files and directories for this task
+        if agent_type == "developer":
+            # Implement task-specific functionality for developers
+            if project_type == "flutter":
+                if "database" in task["title"].lower() or "database" in task["description"].lower():
+                    # Create or modify database models and services
+                    model_name = task["title"].split()[-1].lower() if len(task["title"].split()) > 1 else "item"
+                    model_file = os.path.join(project_dir, "lib", "models", f"{model_name}.dart")
+                    model_content = f"""class {model_name.capitalize()} {{
+  final int id;
+  final String title;
+  final String description;
+  final String date;
+
+  {model_name.capitalize()}({{
+    required this.id,
+    required this.title,
+    required this.description,
+    required this.date,
+  }});
+
+  Map<String, dynamic> toMap() {{
+    return {{
+      'id': id,
+      'title': title,
+      'description': description,
+      'date': date,
+    }};
+  }}
+
+  factory {model_name.capitalize()}.fromMap(Map<String, dynamic> map) {{
+    return {model_name.capitalize()}(
+      id: map['id'],
+      title: map['title'],
+      description: map['description'],
+      date: map['date'],
+    );
+  }}
+}}
+"""
+                    os.makedirs(os.path.join(project_dir, "lib", "models"), exist_ok=True)
+                    with open(model_file, "w") as f:
+                        f.write(model_content)
+
+                    log_agent_activity(agent_type, f"Created model class: {model_file}")
+
+                    # Create database service
+                    service_file = os.path.join(project_dir, "lib", "services", f"{model_name}_service.dart")
+                    service_content = f"""import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import '../models/{model_name}.dart';
+
+class {model_name.capitalize()}Service {{
+  static final {model_name.capitalize()}Service _instance = {model_name.capitalize()}Service._internal();
+  static Database? _database;
+
+  factory {model_name.capitalize()}Service() => _instance;
+
+  {model_name.capitalize()}Service._internal();
+
+  Future<Database> get database async {{
+    if (_database != null) return _database!;
+    _database = await _initDatabase();
+    return _database!;
+  }}
+
+  Future<Database> _initDatabase() async {{
+    final databasesPath = await getDatabasesPath();
+    final path = join(databasesPath, '{project_name}.db');
+
+    return await openDatabase(
+      path,
+      version: 1,
+      onCreate: (db, version) async {{
+        await db.execute('''
+          CREATE TABLE {model_name}s(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            description TEXT,
+            date TEXT
+          )
+        ''');
+      }},
+    );
+  }}
+
+  Future<int> insert({model_name.capitalize()} {model_name}) async {{
+    final db = await database;
+    return await db.insert('{model_name}s', {model_name}.toMap());
+  }}
+
+  Future<List<{model_name.capitalize()}>> getAll() async {{
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      '{model_name}s',
+      orderBy: 'date DESC',
+    );
+
+    return List.generate(maps.length, (i) {{
+      return {model_name.capitalize()}.fromMap(maps[i]);
+    }});
+  }}
+
+  Future<{model_name.capitalize()}?> getById(int id) async {{
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      '{model_name}s',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+
+    if (maps.isNotEmpty) {{
+      return {model_name.capitalize()}.fromMap(maps.first);
+    }}
+    return null;
+  }}
+
+  Future<int> update({model_name.capitalize()} {model_name}) async {{
+    final db = await database;
+    return await db.update(
+      '{model_name}s',
+      {model_name}.toMap(),
+      where: 'id = ?',
+      whereArgs: [{model_name}.id],
+    );
+  }}
+
+  Future<int> delete(int id) async {{
+    final db = await database;
+    return await db.delete(
+      '{model_name}s',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }}
+}}
+"""
+                    os.makedirs(os.path.join(project_dir, "lib", "services"), exist_ok=True)
+                    with open(service_file, "w") as f:
+                        f.write(service_content)
+
+                    log_agent_activity(agent_type, f"Created database service: {service_file}")
+                elif "screen" in task["title"].lower() or "page" in task["description"].lower() or "ui" in task["title"].lower():
+                    # Create a new screen
+                    screen_name = task["title"].split()[-1].lower() if len(task["title"].split()) > 1 else "detail"
+                    screen_file = os.path.join(project_dir, "lib", "screens", f"{screen_name}_screen.dart")
+                    screen_content = f"""import 'package:flutter/material.dart';
+
+class {screen_name.capitalize()}Screen extends StatefulWidget {{
+  @override
+  _{screen_name.capitalize()}ScreenState createState() => _{screen_name.capitalize()}ScreenState();
+}}
+
+class _{screen_name.capitalize()}ScreenState extends State<{screen_name.capitalize()}Screen> {{
+  @override
+  Widget build(BuildContext context) {{
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('{screen_name.capitalize()}'),
+      ),
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: <Widget>[
+            Text(
+              'This is the {screen_name} screen',
+              style: TextStyle(fontSize: 20),
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () {{
+                Navigator.pop(context);
+              }},
+              child: Text('Go Back'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }}
+}}
+"""
+                    os.makedirs(os.path.join(project_dir, "lib", "screens"), exist_ok=True)
+                    with open(screen_file, "w") as f:
+                        f.write(screen_content)
+
+                    log_agent_activity(agent_type, f"Created screen: {screen_file}")
+
+                    # Update main.dart to include the new screen
+                    main_file = os.path.join(project_dir, "lib", "main.dart")
+                    if os.path.exists(main_file):
+                        with open(main_file, "r") as f:
+                            main_content = f.read()
+
+                        # Add import statement if needed
+                        import_line = f"import 'screens/{screen_name}_screen.dart';"
+                        if import_line not in main_content:
+                            import_index = main_content.find("import")
+                            last_import = main_content.rfind("import")
+                            if last_import > import_index:
+                                newline_after_last_import = main_content.find("\n", last_import)
+                                main_content = main_content[:newline_after_last_import + 1] + import_line + "\n" + main_content[newline_after_last_import + 1:]
+                            else:
+                                main_content = import_line + "\n" + main_content
+
+                        # Add route if needed
+                        route_line = f"'/{screen_name}': (context) => {screen_name.capitalize()}Screen(),"
+                        if "routes: {" in main_content and route_line not in main_content:
+                            routes_index = main_content.find("routes: {")
+                            closing_curly = main_content.find("}", routes_index)
+                            main_content = main_content[:closing_curly] + "\n        " + route_line + main_content[closing_curly:]
+
+                        with open(main_file, "w") as f:
+                            f.write(main_content)
+
+                        log_agent_activity(agent_type, f"Updated main.dart to include route to {screen_name} screen")
+                else:
+                    # Create a utility class
+                    util_name = task["title"].split()[-1].lower() if len(task["title"].split()) > 1 else "helper"
+                    util_file = os.path.join(project_dir, "lib", "utils", f"{util_name}.dart")
+                    util_content = f"""class {util_name.capitalize()} {{
+  static String formatDate(DateTime date) {{
+    return "\\${date.year}-\\${date.month.toString().padLeft(2, '0')}-\\${date.day.toString().padLeft(2, '0')}";
+  }}
+
+  static DateTime parseDate(String dateStr) {{
+    final parts = dateStr.split('-');
+    return DateTime(int.parse(parts[0]), int.parse(parts[1]), int.parse(parts[2]));
+  }}
+
+  static String truncateText(String text, int maxLength) {{
+    if (text.length <= maxLength) {{
+      return text;
+    }}
+    return '\\${text.substring(0, maxLength)}...';
+  }}
+}}
+"""
+                    os.makedirs(os.path.join(project_dir, "lib", "utils"), exist_ok=True)
+                    with open(util_file, "w") as f:
+                        f.write(util_content)
+
+                    log_agent_activity(agent_type, f"Created utility class: {util_file}")
+
+        elif agent_type == "ui_ux":
+            # Implement UI/UX design tasks
+            if project_type == "flutter":
+                # Create UI components
+                component_name = task["title"].split()[-1].lower() if len(task["title"].split()) > 1 else "component"
+                component_file = os.path.join(project_dir, "lib", "widgets", f"{component_name}_widget.dart")
+                component_content = f"""import 'package:flutter/material.dart';
+
+class {component_name.capitalize()}Widget extends StatelessWidget {{
+  final String title;
+  final String? subtitle;
+  final VoidCallback? onTap;
+
+  const {component_name.capitalize()}Widget({{
+    Key? key,
+    required this.title,
+    this.subtitle,
+    this.onTap,
+  }}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {{
+    return Card(
+      margin: EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+      child: ListTile(
+        title: Text(title),
+        subtitle: subtitle != null ? Text(subtitle!) : null,
+        trailing: Icon(Icons.arrow_forward_ios),
+        onTap: onTap,
+      ),
+    );
+  }}
+}}
+"""
+                os.makedirs(os.path.join(project_dir, "lib", "widgets"), exist_ok=True)
+                with open(component_file, "w") as f:
+                    f.write(component_content)
+
+                log_agent_activity(agent_type, f"Created UI widget: {component_file}")
+
+                # Create theme file
+                theme_file = os.path.join(project_dir, "lib", "theme", "app_theme.dart")
+                theme_content = """import 'package:flutter/material.dart';
+
+class AppTheme {
+  static ThemeData get lightTheme {
+    return ThemeData(
+      primarySwatch: Colors.blue,
+      brightness: Brightness.light,
+      visualDensity: VisualDensity.adaptivePlatformDensity,
+      appBarTheme: AppBarTheme(
+        elevation: 0,
+        backgroundColor: Colors.blue,
+        foregroundColor: Colors.white,
+      ),
+      cardTheme: CardTheme(
+        elevation: 2,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+      buttonTheme: ButtonThemeData(
+        buttonColor: Colors.blue,
+        textTheme: ButtonTextTheme.primary,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+    );
+  }
+
+  static ThemeData get darkTheme {
+    return ThemeData(
+      primarySwatch: Colors.blue,
+      brightness: Brightness.dark,
+      visualDensity: VisualDensity.adaptivePlatformDensity,
+      appBarTheme: AppBarTheme(
+        elevation: 0,
+        backgroundColor: Colors.blueGrey[800],
+        foregroundColor: Colors.white,
+      ),
+      cardTheme: CardTheme(
+        elevation: 2,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+      buttonTheme: ButtonThemeData(
+        buttonColor: Colors.blue,
+        textTheme: ButtonTextTheme.primary,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+      ),
+    );
+  }
+}
+"""
+                os.makedirs(os.path.join(project_dir, "lib", "theme"), exist_ok=True)
+                with open(theme_file, "w") as f:
+                    f.write(theme_content)
+
+                log_agent_activity(agent_type, f"Created app theme: {theme_file}")
+
+                # Update main.dart to use the theme
+                main_file = os.path.join(project_dir, "lib", "main.dart")
+                if os.path.exists(main_file):
+                    with open(main_file, "r") as f:
+                        main_content = f.read()
+
+                    # Add import statement if needed
+                    import_line = "import 'theme/app_theme.dart';"
+                    if import_line not in main_content:
+                        import_index = main_content.find("import")
+                        last_import = main_content.rfind("import")
+                        if last_import > import_index:
+                            newline_after_last_import = main_content.find("\n", last_import)
+                            main_content = main_content[:newline_after_last_import + 1] + import_line + "\n" + main_content[newline_after_last_import + 1:]
+                        else:
+                            main_content = import_line + "\n" + main_content
+
+                    # Update theme if needed
+                    theme_line = "theme: AppTheme.lightTheme,"
+                    if "theme: ThemeData(" in main_content:
+                        theme_index = main_content.find("theme: ThemeData(")
+                        closing_paren = main_content.find(")", theme_index)
+                        main_content = main_content[:theme_index] + theme_line + main_content[closing_paren + 1:]
+
+                    with open(main_file, "w") as f:
+                        f.write(main_content)
+
+                    log_agent_activity(agent_type, "Updated main.dart to use the app theme")
+
+        elif agent_type == "testing":
+            # Implement testing tasks
+            if project_type == "flutter":
+                # Create a test file
+                test_name = task["title"].split()[-1].lower() if len(task["title"].split()) > 1 else "widget"
+                test_file = os.path.join(project_dir, "test", f"{test_name}_test.dart")
+                test_content = """import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/widgets.dart';
+
+void main() {
+  testWidgets('Basic widget test', (WidgetTester tester) async {
+    // Build a test widget
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: Center(
+          child: Text('Test'),
+        ),
+      ),
+    ));
+
+    // Verify the widget was built
+    expect(find.text('Test'), findsOneWidget);
+  });
+
+  test('Basic unit test', () {
+    expect(2 + 2, equals(4));
+  });
+}
+"""
+                os.makedirs(os.path.join(project_dir, "test"), exist_ok=True)
+                with open(test_file, "w") as f:
+                    f.write(test_content)
+
+                log_agent_activity(agent_type, f"Created test file: {test_file}")
+
+                # Create a test plan
+                test_plan_file = os.path.join(project_dir, "test", "test_plan.md")
+                test_plan_content = f"""# Test Plan for {project_name}
+
+## Test Scope
+- Unit tests for core functionality
+- Widget tests for UI components
+- Integration tests for key workflows
+
+## Test Strategy
+- Focus on critical features first
+- Automated tests for regression testing
+- Manual testing for complex UI interactions
+
+## Test Cases
+1. Application launch and initialization
+2. Navigation between screens
+3. Data persistence
+4. Form validation
+5. Error handling
+
+## Test Environment
+- Flutter test framework
+- Mock data for database tests
+- Different device sizes for UI testing
+"""
+                with open(test_plan_file, "w") as f:
+                    f.write(test_plan_content)
+
+                log_agent_activity(agent_type, f"Created test plan: {test_plan_file}")
+
+        elif agent_type == "documentation":
+            # Implement documentation tasks
+            # Create a README file
+            readme_file = os.path.join(project_dir, "README.md")
+            readme_content = f"""# {project_name.replace('_', ' ').title()}
+
+{project_requirements}
+
+## Features
+
+- Feature 1
+- Feature 2
+- Feature 3
+
+## Getting Started
+
+### Prerequisites
+
+- Flutter SDK (for mobile projects)
+- Android Studio / Xcode (for deployment)
+
+### Installation
+
+1. Clone this repository
+2. Navigate to the project directory
+3. Run `flutter pub get` to install dependencies
+4. Run `flutter run` to start the app
+
+## Project Structure
+
+- `lib/`: Contains the main Dart code
+  - `screens/`: UI screens
+  - `widgets/`: Reusable UI components
+  - `models/`: Data models
+  - `services/`: Business logic and API services
+  - `utils/`: Utility functions
+  - `theme/`: App theme definition
+
+## Screenshots
+
+(Screenshots will be added once the app is fully developed)
+
+## Testing
+
+Run `flutter test` to execute the test suite.
+"""
+            with open(readme_file, "w") as f:
+                f.write(readme_content)
+
+            log_agent_activity(agent_type, f"Created README: {readme_file}")
+
+            # Create a user guide
+            docs_dir = os.path.join(project_dir, "docs")
+            os.makedirs(docs_dir, exist_ok=True)
+
+            user_guide_file = os.path.join(docs_dir, "user_guide.md")
+            user_guide_content = f"""# User Guide for {project_name.replace('_', ' ').title()}
+
+## Getting Started
+
+### Installation
+1. Download the app from the app store
+2. Open the app
+3. Create an account or log in
+
+### Main Features
+
+#### Feature 1
+Description of feature 1 and how to use it.
+
+#### Feature 2
+Description of feature 2 and how to use it.
+
+#### Feature 3
+Description of feature 3 and how to use it.
+
+## Troubleshooting
+
+### Common Issues
+- Issue 1: Solution for issue 1
+- Issue 2: Solution for issue 2
+- Issue 3: Solution for issue 3
+
+## Contact Support
+If you need help, please contact us at support@example.com
+"""
+            with open(user_guide_file, "w") as f:
+                f.write(user_guide_content)
+
+            log_agent_activity(agent_type, f"Created user guide: {user_guide_file}")
+
+        elif agent_type == "integration":
+            # Implement integration tasks
+            if project_type == "flutter":
+                # Create API service
+                api_service_file = os.path.join(project_dir, "lib", "services", "api_service.dart")
+                api_service_content = """import 'dart:convert';
+import 'package:http/http.dart' as http;
+
+class ApiService {
+  final String baseUrl;
+  final Map<String, String> headers;
+
+  ApiService({
+    required this.baseUrl,
+    this.headers = const {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  Future<dynamic> get(String endpoint) async {
+    final response = await http.get(
+      Uri.parse('$baseUrl/$endpoint'),
+      headers: headers,
+    );
+
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      throw Exception('Failed to load data: ${response.statusCode}');
+    }
+  }
+
+  Future<dynamic> post(String endpoint, Map<String, dynamic> data) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/$endpoint'),
+      headers: headers,
+      body: json.encode(data),
+    );
+
+    if (response.statusCode == 200 || response.statusCode == 201) {
+      return json.decode(response.body);
+    } else {
+      throw Exception('Failed to post data: ${response.statusCode}');
+    }
+  }
+
+  Future<dynamic> put(String endpoint, Map<String, dynamic> data) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/$endpoint'),
+      headers: headers,
+      body: json.encode(data),
+    );
+
+    if (response.statusCode == 200) {
+      return json.decode(response.body);
+    } else {
+      throw Exception('Failed to update data: ${response.statusCode}');
+    }
+  }
+
+  Future<void> delete(String endpoint) async {
+    final response = await http.delete(
+      Uri.parse('$baseUrl/$endpoint'),
+      headers: headers,
+    );
+
+    if (response.statusCode != 200 && response.statusCode != 204) {
+      throw Exception('Failed to delete data: ${response.statusCode}');
+    }
+  }
+}
+"""
+                os.makedirs(os.path.join(project_dir, "lib", "services"), exist_ok=True)
+                with open(api_service_file, "w") as f:
+                    f.write(api_service_content)
+
+                log_agent_activity(agent_type, f"Created API service: {api_service_file}")
+
+                # Create a repository class
+                repository_file = os.path.join(project_dir, "lib", "services", "repository.dart")
+                repository_content = """import 'api_service.dart';
+
+class Repository {
+  final ApiService apiService;
+
+  Repository({required this.apiService});
+
+  Future<List<dynamic>> getItems() async {
+    final data = await apiService.get('items');
+    return data as List<dynamic>;
+  }
+
+  Future<Map<String, dynamic>> getItemById(int id) async {
+    final data = await apiService.get('items/$id');
+    return data as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> createItem(Map<String, dynamic> item) async {
+    final data = await apiService.post('items', item);
+    return data as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> updateItem(int id, Map<String, dynamic> item) async {
+    final data = await apiService.put('items/$id', item);
+    return data as Map<String, dynamic>;
+  }
+
+  Future<void> deleteItem(int id) async {
+    await apiService.delete('items/$id');
+  }
+}
+"""
+                with open(repository_file, "w") as f:
+                    f.write(repository_content)
+
+                log_agent_activity(agent_type, f"Created repository: {repository_file}")
+
+                # Add HTTP dependency to pubspec.yaml if it doesn't exist
+                pubspec_file = os.path.join(project_dir, "pubspec.yaml")
+                if os.path.exists(pubspec_file):
+                    with open(pubspec_file, "r") as f:
+                        pubspec_content = f.read()
+
+                    if "http:" not in pubspec_content:
+                        dependencies_index = pubspec_content.find("dependencies:")
+                        flutter_sdk_index = pubspec_content.find("flutter:", dependencies_index)
+                        next_line_index = pubspec_content.find("\n", flutter_sdk_index)
+                        pubspec_content = pubspec_content[:next_line_index] + "\n  http: ^0.13.4" + pubspec_content[next_line_index:]
+
+                        with open(pubspec_file, "w") as f:
+                            f.write(pubspec_content)
+
+                        log_agent_activity(agent_type, "Added HTTP dependency to pubspec.yaml")
+
+        # Mark task as completed
+        orchestrator.db_connector.update_task(task_id, {"status": "completed"})
+
+        # Update in session state
+        for i, t in enumerate(st.session_state.tasks):
+            if t.get("id") == task_id:
+                st.session_state.tasks[i]["status"] = "completed"
+
+        # Log completion
+        log_agent_activity(agent_type, f"Implemented task '{task['title']}' in project '{project_name}'")
+        return True
+
+    except Exception as e:
+        log_agent_activity(agent_type, f"Error executing task: {str(e)}")
+        traceback.print_exc()
+
+        # Mark task as failed
+        orchestrator.db_connector.update_task(task_id, {"status": "failed"})
+
+        # Update in session state
+        for i, t in enumerate(st.session_state.tasks):
+            if t.get("id") == task_id:
+                st.session_state.tasks[i]["status"] = "failed"
+
+        return False
+
+# Function to run all pending tasks for an agent
+def run_agent_tasks(agent_type):
+    orchestrator = st.session_state.orchestrator
+    
+    # Get agent
+    agent = orchestrator.system_state.get_agent_by_type(agent_type)
+    if not agent:
+        log_agent_activity("system", f"{agent_type} agent not found")
+        return False
+    
+    # Get tasks for this agent
+    agent_tasks = [t for t in st.session_state.tasks if t.get("assigned_agent") == agent_type]
+    
+    # Get task status from database to filter out completed ones
+    pending_tasks = []
+    for task in agent_tasks:
+        db_task = orchestrator.db_connector.get_task(task["id"])
+        if db_task and db_task["status"] not in ["completed", "failed"]:
+            pending_tasks.append(task)
+    
+    if not pending_tasks:
+        log_agent_activity(agent_type, "No pending tasks assigned to me")
+        return False
+    
+    # Run each task
+    log_agent_activity(agent_type, f"Starting work on {len(pending_tasks)} tasks")
+    
+    success_count = 0
+    for task in pending_tasks:
+        result = run_task(task["id"])
+        if result:
+            success_count += 1
+    
+    log_agent_activity(agent_type, f"Completed {success_count} out of {len(pending_tasks)} tasks")
+    return True
+
+# Function to run tasks for all agents
+def run_all_tasks():
+    orchestrator = st.session_state.orchestrator
+    
+    # Get all pending tasks
+    pending_tasks = []
+    for task in st.session_state.tasks:
+        db_task = orchestrator.db_connector.get_task(task["id"])
+        if db_task and db_task["status"] not in ["completed", "failed"]:
+            pending_tasks.append(task)
+    
+    if not pending_tasks:
+        log_agent_activity("system", "No pending tasks to execute")
+        return False
+    
+    log_agent_activity("system", f"Starting execution of {len(pending_tasks)} tasks")
+    
+    # Group tasks by agent for better execution flow
+    tasks_by_agent = {}
+    for task in pending_tasks:
+        agent_type = task.get("assigned_agent", "developer")
+        if agent_type not in tasks_by_agent:
+            tasks_by_agent[agent_type] = []
+        tasks_by_agent[agent_type].append(task)
+    
+    # Run tasks by agent type in a logical order
+    agent_order = ["developer", "ui_ux", "integration", "testing", "documentation"]
+    
+    success_count = 0
+    for agent_type in agent_order:
+        if agent_type in tasks_by_agent:
+            agent_tasks = tasks_by_agent[agent_type]
+            log_agent_activity("system", f"Running {len(agent_tasks)} tasks for {agent_type}")
+            
+            for task in agent_tasks:
+                result = run_task(task["id"])
+                if result:
+                    success_count += 1
+    
+    # Run any remaining tasks for agents not in the predefined order
+    for agent_type, agent_tasks in tasks_by_agent.items():
+        if agent_type not in agent_order:
+            log_agent_activity("system", f"Running {len(agent_tasks)} tasks for {agent_type}")
+            
+            for task in agent_tasks:
+                result = run_task(task["id"])
+                if result:
+                    success_count += 1
+    
+    log_agent_activity("system", f"Completed {success_count} out of {len(pending_tasks)} tasks")
+    return True
+
+# Page Layout
+st.title("🚀 AI Development Team")
+st.markdown("""
+This system creates complete, runnable applications based on your requirements.
+When you run tasks, real project files are created in the 'projects' directory.
+""")
+
+# Project Requirements Input
+with st.expander("Project Requirements", expanded=not st.session_state.project_id):
+    requirements_input = st.text_area(
+        "Enter your project requirements:",
+        height=200,
+        value=st.session_state.requirements,
+        placeholder="Example: I want a pet diary mobile app for tracking feeding, walking, and vet visits. It should work on both Android and iOS."
+    )
+
+    if st.button("Process Requirements"):
+        if requirements_input:
+            st.session_state.requirements = requirements_input
+            with st.spinner("Processing requirements..."):
+                success = process_requirements(requirements_input)
+                if success:
+                    st.success("Requirements processed successfully! Click 'Run All Tasks' to create the application.")
+                else:
+                    st.error("Error processing requirements")
+        else:
+            st.warning("Please enter project requirements")
+
+# Main layout with two columns
+col1, col2 = st.columns([2, 3])
+
+# Agent buttons and task list in first column
+with col1:
+    st.subheader("Project Tasks")
+    
+    # Run All Tasks button
+    if st.button("🚀 Run All Tasks", use_container_width=True):
+        if st.session_state.tasks:
+            with st.spinner("Running all tasks..."):
+                log_agent_activity("system", "Running all pending tasks")
+                run_all_tasks()
+        else:
+            st.warning("No tasks available. Process requirements first.")
+    
+    # Group tasks by agent
+    if st.session_state.tasks:
+        tasks_by_agent = {}
+        for task in st.session_state.tasks:
+            agent = task.get("assigned_agent", "unassigned")
+            if agent not in tasks_by_agent:
+                tasks_by_agent[agent] = []
+            tasks_by_agent[agent].append(task)
+        
+        # Display tasks by agent
+        for agent, tasks in tasks_by_agent.items():
+            # Count tasks by status for this agent
+            total_tasks = len(tasks)
+            completed_tasks = sum(1 for t in tasks if t.get("status") == "completed")
+            in_progress_tasks = sum(1 for t in tasks if t.get("status") == "in_progress")
+            
+            # Create status summary
+            status_summary = f"Total: {total_tasks}, Completed: {completed_tasks}, In Progress: {in_progress_tasks}"
+            
+            with st.expander(f"{agent.replace('_', ' ').title()} Tasks - {status_summary}", expanded=True):
+                # Add a "Run All Agent Tasks" button
+                if st.button(f"Run All {agent.replace('_', ' ').title()} Tasks", key=f"run_all_{agent}"):
+                    with st.spinner(f"Running all {agent} tasks..."):
+                        log_agent_activity("system", f"Running all {agent} tasks")
+                        run_agent_tasks(agent)
+                
+                # Show each task with a "Run Task" button
+                for task in tasks:
+                    # Get status from database to ensure it's current
+                    db_task = db_connector.get_task(task["id"])
+                    status = db_task["status"] if db_task else task.get("status", "created")
+                    
+                    # Status color
+                    status_color = "gray"
+                    if status == "completed":
+                        status_color = "green"
+                    elif status == "in_progress":
+                        status_color = "blue"
+                    elif status == "failed":
+                        status_color = "red"
+                    
+                    # Create columns for task info and run button
+                    task_col1, task_col2 = st.columns([4, 1])
+                    
+                    with task_col1:
+                        st.markdown(f"""
+                        <div style="
+                            border-left: 5px solid {status_color};
+                            padding: 10px;
+                            margin-bottom: 15px;
+                            border-radius: 3px;
+                            background-color: rgba(0,0,0,0.03);
+                        ">
+                            <strong>{task['title']}</strong><br>
+                            <small style="color: {status_color};">Status: {status}</small>
+                            <p style="margin-top: 5px; margin-bottom: 0; font-size: 0.8em;">{task.get('description', 'No description')[:100]}...</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    with task_col2:
+                        # Only show Run button if task is not completed
+                        if status not in ["completed", "in_progress"]:
+                            if st.button("Run", key=f"run_task_{task['id']}"):
+                                with st.spinner(f"Running task: {task['title']}"):
+                                    run_task(task["id"])
+    else:
+        st.info("No tasks created yet. Process requirements to create tasks.")
+
+# Agent activity log in second column
+with col2:
+    st.subheader("Agent Activity Log")
+
+    # Display logs
+    for log in reversed(st.session_state.agent_logs):
+        # Different colors and icons for different agents
+        if log["agent"] == "project_manager":
+            icon = "👨‍💼"
+            color = "#1E88E5"
+        elif log["agent"] == "developer":
+            icon = "👩‍💻"
+            color = "#43A047"
+        elif log["agent"] == "ui_ux":
+            icon = "🎨"
+            color = "#E91E63"
+        elif log["agent"] == "integration":
+            icon = "🔄"
+            color = "#FF9800"
+        elif log["agent"] == "testing":
+            icon = "🧪"
+            color = "#9C27B0"
+        elif log["agent"] == "documentation":
+            icon = "📝"
+            color = "#795548"
+        elif log["agent"] == "system":
+            icon = "⚙️"
+            color = "#607D8B"
+        else:
+            icon = "🤖"
+            color = "#757575"
+
+        # Format timestamp
+        timestamp = log["timestamp"].strftime("%H:%M:%S")
+
+        # Display log entry
+        st.markdown(f"""
+        <div style="
+            border-left: 3px solid {color};
+            padding-left: 10px;
+            margin-bottom: 5px;
+            border-radius: 3px;
+        ">
+            <small style="color: gray;">{timestamp}</small><br>
+            <strong>{icon} {log["agent"].replace('_', ' ').title()}:</strong> {log["message"]}
+        </div>
+        """, unsafe_allow_html=True)
+
+# Created Applications section - show created projects
+st.markdown("## Created Applications")
+
+# Check for created projects
+projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
+if os.path.exists(projects_dir) and os.listdir(projects_dir):
+    created_projects = os.listdir(projects_dir)
+    st.success(f"{len(created_projects)} project(s) created successfully in the 'projects' directory")
+
+    # Display a list of created projects with expandable details
+    for project_name in created_projects:
+        project_path = os.path.join(projects_dir, project_name)
+        if os.path.isdir(project_path):
+            with st.expander(f"📱 {project_name.replace('_', ' ').title()}"):
+                st.markdown(f"**Path:** `{project_path}`")
+
+                # Try to determine project type from structure
+                project_type = "Unknown"
+                if os.path.exists(os.path.join(project_path, "pubspec.yaml")):
+                    project_type = "Flutter (iOS & Android)"
+                elif os.path.exists(os.path.join(project_path, "app", "build.gradle")):
+                    project_type = "Android"
+                elif os.path.exists(os.path.join(project_path, "package.json")):
+                    if os.path.exists(os.path.join(project_path, "ios")) and os.path.exists(os.path.join(project_path, "android")):
+                        project_type = "React Native (iOS & Android)"
+                    else:
+                        project_type = "Web (React/Node.js)"
+
+                st.markdown(f"**Type:** {project_type}")
+
+                # List main directories
+                st.markdown("**Key Directories:**")
+                main_dirs = []
+                for item in os.listdir(project_path):
+                    item_path = os.path.join(project_path, item)
+                    if os.path.isdir(item_path) and not item.startswith('.'):
+                        main_dirs.append(f"- `{item}/`")
+
+                        # List up to 5 files in important directories like lib, src, app
+                        if item in ["lib", "src", "app", "public", "assets"]:
+                            sub_items = os.listdir(item_path)
+                            for i, sub_item in enumerate(sub_items[:5]):
+                                main_dirs.append(f"  - `{item}/{sub_item}`")
+                            if len(sub_items) > 5:
+                                main_dirs.append(f"  - ... and {len(sub_items) - 5} more files")
+
+                # Also list the main files in the project root
+                for item in os.listdir(project_path):
+                    item_path = os.path.join(project_path, item)
+                    if os.path.isfile(item_path) and not item.startswith('.'):
+                        main_dirs.append(f"- `{item}`")
+
+                st.markdown("\n".join(main_dirs))
+
+                # Add a button to open the project in VS Code (if available)
+                if st.button(f"Open '{project_name}' in VS Code", key=f"open_{project_name}"):
+                    # Check if VS Code command exists in PATH
+                    code_exists = os.system("which code > /dev/null 2>&1") == 0
+                    if code_exists:
+                        os.system(f"code {project_path}")
+                        st.success(f"Opened {project_name} in VS Code")
+                    else:
+                        st.error("VS Code command 'code' not found. Make sure VS Code is installed and the command is in your PATH.")
+else:
+    st.info("No applications created yet. Run tasks to generate complete applications.")
+
+# Reset button in sidebar
+with st.sidebar:
+    st.header("Project Controls")
+
+    if st.button("Reset System"):
+        st.session_state.project_id = None
+        st.session_state.tasks = []
+        st.session_state.agent_logs = []
+        st.session_state.orchestrator = SimpleOrchestrator(db_connector=db_connector)
+        st.session_state.requirements = ""
+        st.session_state.project_outputs = {}
+        st.rerun()
+
+    # Claude API Configuration
+    st.header("AI Configuration")
+
+    # Check if required dependencies are installed
+    import importlib.util
+    anthropic_installed = importlib.util.find_spec("anthropic") is not None
+    dotenv_installed = importlib.util.find_spec("python_dotenv") is not None
+
+    if not anthropic_installed or not dotenv_installed:
+        st.error("Required dependencies are missing.")
+        install_commands = []
+
+        if not anthropic_installed:
+            install_commands.append("pip install anthropic")
+
+        if not dotenv_installed:
+            install_commands.append("pip install python-dotenv")
+
+        st.code("\n".join(install_commands), language="bash")
+        st.info("After installing the dependencies, restart the Streamlit app.")
+
+    # Capture API key in session state if not already there
+    if "claude_api_key" not in st.session_state:
+        st.session_state.claude_api_key = os.getenv("ANTHROPIC_API_KEY", "")
+
+    # API key input
+    api_key = st.text_input(
+        "Claude API Key",
+        value=st.session_state.claude_api_key,
+        type="password",
+        help="Enter your Anthropic API key to enable Claude for intelligent project name extraction"
+    )
+
+    # Update API key if changed
+    if api_key != st.session_state.claude_api_key:
+        st.session_state.claude_api_key = api_key
+        os.environ["ANTHROPIC_API_KEY"] = api_key if api_key else ""
+
+        # Reinitialize the Claude client if API key changed
+        if api_key:
+            claude_client.__init__()
+            if claude_client.is_available():
+                st.success("Claude API configured successfully!")
+            else:
+                st.error("Failed to initialize Claude API client. Please check your API key.")
+        else:
+            st.warning("Claude API key not provided. Using rule-based project name extraction.")
+
+    # Show Claude status
+    if claude_client.is_available():
+        st.info("✅ Claude API is configured and ready to use")
+    else:
+        st.warning("⚠️ Claude API is not configured. Using rule-based extraction.")
+
+    # Add project info to sidebar if we have a project
+    if st.session_state.project_id:
+        project = db_connector.get_project(st.session_state.project_id)
+        if project:
+            st.header("Project Information")
+            st.write(f"**Name:** {project['name']}")
+            st.write(f"**Created:** {format_timestamp(project['created_at'])}")
+            
+            # Task statistics
+            task_count = len(st.session_state.tasks)
+            completed_tasks = sum(1 for t in st.session_state.tasks if db_connector.get_task(t["id"])["status"] == "completed")
+            
+            st.write(f"**Tasks:** {task_count}")
+            st.write(f"**Completed:** {completed_tasks}")
+            
+            # Progress bar
+            progress = completed_tasks / task_count if task_count > 0 else 0
+            st.progress(progress)
+
+# Initialize with a welcome message
+if not st.session_state.agent_logs:
+    log_agent_activity("system", "Welcome to the AI Development Team! Start by entering your project requirements and clicking 'Process Requirements'.")
